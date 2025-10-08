@@ -10,7 +10,7 @@ app: app.c libapp.so
 	$(CC) $(CFLAGS) -o $@ $< -L. -lapp
 
 libinj.so: inj_lib.c
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ $< -ldl
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ $<
 
 inject: inject.c
 	$(CC) $(CFLAGS) -o $@ $<
