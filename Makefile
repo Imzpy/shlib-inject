@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -g
+CFLAGS = -Wall -Wextra -Wno-sign-compare -std=c99 -g -Wno-unused-parameter
 
 all: libapp.so app libinj.so inject
 

@@ -187,7 +187,8 @@ int main() {
 	dlopen("/data/users/andriin/shlib-inject/libinj.so", RTLD_LAZY);
 	       */
 
-	//dlopen("/data/users/andriin/shlib-inject/libinj.so", RTLD_LAZY);
+	//void *res = dlopen("./libinj.so", RTLD_LAZY);
+	//printf("DLOPEN RES %lx\n", (long)res);
 
 	while (1) {
 		char buf[256];
