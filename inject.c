@@ -19,6 +19,12 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <linux/ptrace.h>
+
+/* ARM64 specific ptrace constant */
+#ifndef NT_ARM_SYSTEM_CALL
+#define NT_ARM_SYSTEM_CALL 0x404
+#endif
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
 #define max(x, y) ((x) < (y) ? (y) : (x))
@@ -26,38 +32,45 @@
 
 static volatile sig_atomic_t should_exit = 0;
 
-extern char __inj_call;
-extern char __inj_call_end;
-extern char __inj_trap;
-#define __inj_call_sz ((size_t)(&__inj_call_end - &__inj_call))
+extern char __inj_call[];
+extern char __inj_call_end[];
+extern char __inj_trap[];
+#define __inj_call_sz ((size_t)(__inj_call_end - __inj_call))
 
 static bool verbose = false;
 
 #define dprintf(fmt, ...) if (verbose) printf(fmt, ##__VA_ARGS__)
 
 /* function calling injection code */
-void __attribute__((naked)) inj_call(void)
-{
-	/* rax: address of a function to call
+#if defined(__x86_64__)
+	/*
+	 * rax: address of a function to call
 	 * rdi, rsi, rdx, rcx, r8, r9: arguments passed to a function
-	 *
-	 * For dlopen() call injection:
-	 *   rax: dlopen() address (void *dlopen(const char *filename, int flags);)
-	 *   rdi: address of path to shared library
-	 *   rsi: set to 2 (RTLD_LAZY)
-	 *
-	 * For dlclose() call injection:
-	 *   rax: dlclose() address (int dlclose(void *handle);)
-	 *   rdi: handle to pass to dlclose
+	 * return: rax contains the result
 	 */
-	__asm__ __volatile__ (
+	__asm__(
 	"__inj_call:					\n\t"
 	"	call *%rax				\n\t"
 	"__inj_trap:					\n\t"
 	"	int3					\n\t"
 	"__inj_call_end:				\n\t"
 	);
-}
+#elif defined(__aarch64__)
+	/*
+	 * x8: address of a function to call
+	 * x0-x7: arguments passed to a function
+	 * return: x0 contains the result
+	 */
+	__asm__(
+	"__inj_call:					\n\t"
+	"	blr x8					\n\t"
+	"__inj_trap:					\n\t"
+	"	brk #0					\n\t"
+	"__inj_call_end:				\n\t"
+	);
+#else
+#error "Only x86-64 and arm64 are supported"
+#endif
 
 static void signal_handler(int /*sig*/)
 {
@@ -206,14 +219,27 @@ static long find_elf_sym_info(const char *elf_path, const char *sym_name)
 		goto cleanup;
 	}
 
-	/* XXX: ARM64 will need updating */
+	/* Check ELF header and architecture */
 	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)mapped;
 	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
-	    ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
-	    ehdr->e_machine != EM_X86_64) {
-		fprintf(stderr, "Invalid ELF file or not x86_64: %s\n", elf_path);
+	    ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+		fprintf(stderr, "Invalid ELF file or not 64-bit: %s\n", elf_path);
 		goto cleanup;
 	}
+
+#if defined(__x86_64__)
+	if (ehdr->e_machine != EM_X86_64) {
+		fprintf(stderr, "ELF file is not x86_64: %s\n", elf_path);
+		goto cleanup;
+	}
+#elif defined(__aarch64__)
+	if (ehdr->e_machine != EM_AARCH64) {
+		fprintf(stderr, "ELF file is not aarch64: %s\n", elf_path);
+		goto cleanup;
+	}
+#else
+#error "Unsupported architecture"
+#endif
 
 	if (ehdr->e_shoff + ehdr->e_shnum * sizeof(Elf64_Shdr) > file_size) {
 		fprintf(stderr, "Section headers extend beyond file size\n");
@@ -325,7 +351,6 @@ cleanup:
 	return result;
 }
 
-__attribute__((unused))
 static int remote_vm_write(int pid, const void *remote_dst, const void *local_src, size_t sz)
 {
 	struct iovec local, remote;
@@ -345,7 +370,7 @@ static int remote_vm_write(int pid, const void *remote_dst, const void *local_sr
 	return 0;
 }
 
-__attribute__((unused))
+__unused
 static int remote_vm_read(int pid, const void *local_dst, const void *remote_src, size_t sz)
 {
 	struct iovec local, remote;
@@ -370,81 +395,49 @@ static void print_regs(const struct user_regs_struct *regs, const char *pfx)
 	if (pfx)
 		printf("%s: ", pfx);
 
+#if defined(__x86_64__)
 	printf("rip=%llx rax=%llx (orig_rax=%llx) rdi=%llx rsi=%llx rdx=%llx r10=%llx r8=%llx r9=%llx rbp=%llx rsp=%llx\n",
 		regs->rip, regs->rax, regs->orig_rax, regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9,
 		regs->rbp, regs->rsp);
+#elif defined(__aarch64__)
+	printf("pc=%llx sp=%llx x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx x5=%llx x8=%llx\n",
+		regs->pc, regs->sp, regs->regs[0], regs->regs[1], regs->regs[2], regs->regs[3],
+		regs->regs[4], regs->regs[5], regs->regs[8]);
+#else
+#error "Unsupported architecture"
+#endif
 }
 
 static int ptrace_get_regs(int pid, struct user_regs_struct *regs, const char *descr)
 {
-	if (ptrace(PTRACE_GETREGS, pid, NULL, regs) < 0) {
+	struct iovec iov = {
+		.iov_base = regs,
+		.iov_len = sizeof(*regs),
+	};
+
+	if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
 		int err = -errno;
-		fprintf(stderr, "ptrace(PTRACE_GETREGS, PID %d, %s) failed: %d\n", pid, descr, err);
+		fprintf(stderr, "ptrace(PTRACE_GETREGSET, PID %d, %s) failed: %d\n", pid, descr, err);
 		return err;
 	}
+	dprintf("PTRACE_GETREGSET(%d, %s)\n", pid, descr);
 	return 0;
 }
 
 static int ptrace_set_regs(int pid, const struct user_regs_struct *regs, const char *descr)
 {
-	if (ptrace(PTRACE_SETREGS, pid, NULL, regs) < 0) {
+	struct iovec iov = {
+		.iov_base = (void *)regs,
+		.iov_len = sizeof(*regs),
+	};
+
+	if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) < 0) {
 		int err = -errno;
-		fprintf(stderr, "ptrace(PTRACE_SETREGS, PID %d, %s) failed: %d\n", pid, descr, err);
+		fprintf(stderr, "ptrace(PTRACE_SETREGSET, PID %d, %s) failed: %d\n", pid, descr, err);
 		return err;
 	}
 
-	dprintf("PTRACE_SETREGS(%d)\n", pid);
-	return 0;
-}
-
-static int ptrace_set_options(int pid, int options, const char *descr)
-{
-	if (ptrace(PTRACE_SETOPTIONS, pid, NULL, options) < 0) {
-		int err = -errno;
-		fprintf(stderr, "ptrace(PTRACE_SETOPTIONS, PID %d, opts %x, %s) failed: %d\n",
-			pid, options, descr, err);
-		return err;
-	}
-	dprintf("PTRACE_SET_OPTIONS(%d, opts %x)\n", pid, options);
-	return 0;
-}
-
-__attribute__((unused))
-static int ptrace_read_insns(int pid, long rip, void *insns, size_t insn_sz, const char *descr)
-{
-	long word;
-
-	for (size_t i = 0; i < insn_sz; i += sizeof(word)) {
-		errno = 0;
-		if ((word = ptrace(PTRACE_PEEKTEXT, pid, rip + i, NULL)) == -1 && errno != 0) {
-			int err = -errno;
-			fprintf(stderr, "ptrace(PTRACE_PEEKTEXT, pid %d, off %zu, %s) failed: %d\n",
-				pid, i, descr, err);
-			return err;
-		}
-		memcpy(insns + i, &word, sizeof(word));
-	}
-	return 0;
-}
-
-static int ptrace_write_insns(int pid, long rip, void *insns, size_t insn_sz, const char *descr)
-{
-	long word;
-	int err;
-
-	for (size_t i = 0; i < insn_sz; i += sizeof(word)) {
-		memcpy(&word, insns + i, sizeof(word));
-
-		errno = 0;
-		if (ptrace(PTRACE_POKETEXT, pid, rip + i, word) < 0) {
-			err = -errno;
-			fprintf(stderr, "ptrace(PTRACE_POKETEXT, pid %d, off %zu, %s) failed: %d\n",
-				pid, i, descr, err);
-			return err;
-		}
-		dprintf("PTRACE_POKETEXT(%d, dst %lx, src %lx, word %lx)\n",
-			pid, (long)rip + i, (long)insns + i, word);
-	}
+	dprintf("PTRACE_SETREGSET(%d, %s)\n", pid, descr);
 	return 0;
 }
 
@@ -476,12 +469,12 @@ static int ptrace_op(int pid, enum __ptrace_request op, long data, const char *d
 	return 0;
 }
 
-static int ptrace_wait_generic(int pid, int signal, bool ptrace_event, long ip __unused, const char *descr)
+static int ptrace_wait_generic(int pid, int signal, bool ptrace_event, long ip, const char *descr)
 {
 	int status, err;
 
 	while (true) {
-		if (waitpid(pid, &status, WUNTRACED) != pid) {
+		if (waitpid(pid, &status, __WALL) != pid) {
 			err = -errno;
 			fprintf(stderr, "waitpid(pid %d, %s) failed: %d\n", pid, descr, err);
 			return err;
@@ -494,18 +487,57 @@ static int ptrace_wait_generic(int pid, int signal, bool ptrace_event, long ip _
 
 		if (WIFSTOPPED(status) &&
 		   (!ptrace_event || (status >> 16) == PTRACE_EVENT_STOP) &&
-		    WSTOPSIG(status) == signal &&
-		    /* TODO: check for IP to match with PTRACE_GETSIGINFO */
-		    (ip == 0 || true /* ip == trapping addr */)) {
+		    WSTOPSIG(status) == signal) {
+			/* Verify IP matches if requested (for SIGTRAP) */
+			if (ip) {
+				struct user_regs_struct regs;
+
+				err = ptrace_get_regs(pid, &regs, descr);
+				if (err)
+					return err;
+
+				/* Note: this IP calculation logic is SIGTRAP specific */
+#if defined(__x86_64__)
+				long trap_ip = regs.rip - 1;
+#elif defined(__aarch64__)
+				long trap_ip = regs.pc;
+#else
+#error "Unsupported architecture"
+#endif
+				if (trap_ip != ip) {
+					fprintf(stderr, "UNEXPECTED IP %lx (expecting %lx) for STOPSIG=%d (%s), PASSING THROUGH BACK TO APP!\n",
+					        trap_ip, ip,
+					        WSTOPSIG(status), sig_name(WSTOPSIG(status)));
+					goto pass_through;
+				}
+			}
+
 			dprintf("STOPPED%s STOPSIG=%d (%s)\n",
 				ptrace_event ? " (PTRACE_EVENT_STOP)" : "",
 				WSTOPSIG(status), sig_name(WSTOPSIG(status)));
 			return 0;
 		}
 
-		printf("PASS-THROUGH SIGNAL %d (%s) (status %x) BACK TO APP\n",
-			WSTOPSIG(status), sig_name(WSTOPSIG(status)), status);
+		{
+			struct user_regs_struct regs;
+			siginfo_t siginfo;
 
+			ptrace_get_regs(pid, &regs, descr);
+			ptrace(PTRACE_GETSIGINFO, pid, 0, &siginfo);
+
+#if defined(__x86_64__)
+			long signal_ip = regs.rip;
+#elif defined(__aarch64__)
+			long signal_ip = regs.pc;
+#else
+#error "Unsupported architecture"
+#endif
+			printf("PASS-THROUGH SIGNAL %d (%s) (status %x, IP %lx, addr %p, code %d) BACK TO PID %d\n",
+			       WSTOPSIG(status), sig_name(WSTOPSIG(status)), status,
+			       signal_ip, siginfo.si_addr, siginfo.si_code, pid);
+		}
+
+pass_through:
 		err = ptrace_op(pid, PTRACE_CONT, WSTOPSIG(status), descr);
 		if (err)
 			return err;
@@ -527,7 +559,71 @@ static int ptrace_wait_syscall(int pid, const char *descr)
 	return ptrace_wait_generic(pid, SIGTRAP | 0x80, false /* !PTRACE_EVENT_STOP */, 0, descr);
 }
 
-__attribute__((unused))
+/* Helper macros for register manipulation */
+#define ___concat(a, b) a ## b
+#define ___apply(fn, n) ___concat(fn, n)
+#define ___nth(_, _1, _2, _3, _4, _5, _6, _7, _8, _9, _a, _b, _c, N, ...) N
+#define ___narg(...) ___nth(_, ##__VA_ARGS__, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+
+#if defined(__x86_64__)
+
+/* function call convention */
+#define ___regs_set_func_args0(_r)
+#define ___regs_set_func_args1(_r, a)                (_r)->rdi = a; ___regs_set_func_args0(_r)
+#define ___regs_set_func_args2(_r, a, b)             (_r)->rsi = b; ___regs_set_func_args1(_r, a)
+#define ___regs_set_func_args3(_r, a, b, c)          (_r)->rdx = c; ___regs_set_func_args2(_r, a, b)
+#define ___regs_set_func_args4(_r, a, b, c, d)       (_r)->rcx = d; ___regs_set_func_args3(_r, a, b, c)
+#define ___regs_set_func_args5(_r, a, b, c, d, e)    (_r)->r8  = e; ___regs_set_func_args4(_r, a, b, c, d)
+#define ___regs_set_func_args6(_r, a, b, c, d, e, f) (_r)->r9  = f; ___regs_set_func_args5(_r, a, b, c, d, e)
+
+/* system call convention */
+#define ___regs_set_sys_args0(_r, nr)                   (_r)->rax = nr;
+#define ___regs_set_sys_args1(_r, nr, a)                (_r)->rdi = a; ___regs_set_sys_args0(_r, nr)
+#define ___regs_set_sys_args2(_r, nr, a, b)             (_r)->rsi = b; ___regs_set_sys_args1(_r, nr, a)
+#define ___regs_set_sys_args3(_r, nr, a, b, c)          (_r)->rdx = c; ___regs_set_sys_args2(_r, nr, a, b)
+#define ___regs_set_sys_args4(_r, nr, a, b, c, d)       (_r)->r10 = d; ___regs_set_sys_args3(_r, nr, a, b, c)
+#define ___regs_set_sys_args5(_r, nr, a, b, c, d, e)    (_r)->r8  = e; ___regs_set_sys_args4(_r, nr, a, b, c, d)
+#define ___regs_set_sys_args6(_r, nr, a, b, c, d, e, f) (_r)->r9  = f; ___regs_set_sys_args5(_r, nr, a, b, c, d, e)
+
+/* ensure 16-byte alignment and set up red zone (necessary on x86-64) */
+#define ___regs_adjust_sp(_r) (_r)->rsp = ((_r)->rsp & ~0xFULL) - 128
+#define ___regs_result(_r) (_r)->rax
+#define ___regs_set_ip(_r, addr) (_r)->rip = addr
+/* set __inj_call's argument (which function to call) */
+#define ___regs_set_tramp_dst(_r, addr) (_r)->rax = addr
+
+#elif defined(__aarch64__)
+
+#define ___regs_set_func_args0(_r)
+#define ___regs_set_func_args1(_r, a)                (_r)->regs[0] = a; ___regs_set_func_args0(_r)
+#define ___regs_set_func_args2(_r, a, b)             (_r)->regs[1] = b; ___regs_set_func_args1(_r, a)
+#define ___regs_set_func_args3(_r, a, b, c)          (_r)->regs[2] = c; ___regs_set_func_args2(_r, a, b)
+#define ___regs_set_func_args4(_r, a, b, c, d)       (_r)->regs[3] = d; ___regs_set_func_args3(_r, a, b, c)
+#define ___regs_set_func_args5(_r, a, b, c, d, e)    (_r)->regs[4] = e; ___regs_set_func_args4(_r, a, b, c, d)
+#define ___regs_set_func_args6(_r, a, b, c, d, e, f) (_r)->regs[5] = f; ___regs_set_func_args5(_r, a, b, c, d, e)
+
+#define ___regs_set_sys_args0(_r, nr)                   (_r)->regs[8] = nr;
+#define ___regs_set_sys_args1(_r, nr, a)                (_r)->regs[0] = a; ___regs_set_sys_args0(_r, nr)
+#define ___regs_set_sys_args2(_r, nr, a, b)             (_r)->regs[1] = b; ___regs_set_sys_args1(_r, nr, a)
+#define ___regs_set_sys_args3(_r, nr, a, b, c)          (_r)->regs[2] = c; ___regs_set_sys_args2(_r, nr, a, b)
+#define ___regs_set_sys_args4(_r, nr, a, b, c, d)       (_r)->regs[3] = d; ___regs_set_sys_args3(_r, nr, a, b, c)
+#define ___regs_set_sys_args5(_r, nr, a, b, c, d, e)    (_r)->regs[4] = e; ___regs_set_sys_args4(_r, nr, a, b, c, d)
+#define ___regs_set_sys_args6(_r, nr, a, b, c, d, e, f) (_r)->regs[5] = f; ___regs_set_sys_args5(_r, nr, a, b, c, d, e)
+
+/* ensure 16-byte alignment (no need for red zone on arm64) */
+#define ___regs_adjust_sp(_r) (_r)->sp = (_r)->sp & ~0xFULL
+#define ___regs_result(_r) (_r)->regs[0]
+#define ___regs_set_ip(_r, addr) (_r)->pc = addr
+/* set __inj_call's argument (which function to call) */
+#define ___regs_set_tramp_dst(_r, addr) (_r)->regs[8] = addr
+
+#else
+#error "Unsupported architecture"
+#endif
+
+#define ___regs_set_func_args(regs, args...)  ___apply(___regs_set_func_args, ___narg(args))(regs, ##args)
+#define ___regs_set_sys_args(regs, nr, args...)  ___apply(___regs_set_sys_args, ___narg(args))(regs, nr, ##args)
+
 static int ptrace_exec_syscall(int pid,
 			       const struct user_regs_struct *pre_regs,
 			       struct user_regs_struct *post_regs,
@@ -537,35 +633,139 @@ static int ptrace_exec_syscall(int pid,
 
 	err = err ?: ptrace_set_regs(pid, pre_regs, descr);
 	err = err ?: ptrace_op(pid, PTRACE_SYSCALL, 0, descr);
-	err = err ?: ptrace_wait_syscall(pid, descr);
+	err = err ?: ptrace_wait_syscall(pid, descr); /* syscall-enter-stop */
+	err = err ?: ptrace_op(pid, PTRACE_SYSCALL, 0, descr);
+	err = err ?: ptrace_wait_syscall(pid, descr); /* syscall-exit-stop */
 	err = err ?: ptrace_get_regs(pid, post_regs, descr);
 
 	return err;
 }
 
-__attribute__((unused))
-static int ptrace_restart_syscall(int pid,
-			       const struct user_regs_struct *orig_regs,
-			       const char *descr)
+static int ptrace_intercept(int pid, struct user_regs_struct *orig_regs, const char *descr)
+{
+	int err = 0;
+
+	/*
+	 * Attach to tracee
+	 */
+	dprintf("Seizing...\n");
+	if ((err = ptrace_op(pid, PTRACE_SEIZE, PTRACE_O_TRACESYSGOOD, descr)) < 0)
+		return err;
+
+	if ((err = ptrace_op(pid, PTRACE_INTERRUPT, 0, descr)) < 0)
+		goto err_detach;
+	if ((err = ptrace_wait_stop(pid, descr)) < 0)
+		goto err_detach;
+
+	/*
+	 * Take over next syscall
+	 */
+	dprintf("Resuming until syscall...\n");
+	if ((err = ptrace_op(pid, PTRACE_SYSCALL, 0, descr)) < 0)
+		goto err_detach;
+	if ((err = ptrace_wait_syscall(pid, descr)) < 0)
+		goto err_detach;
+	/* backup original registers */
+	if ((err = ptrace_get_regs(pid, orig_regs, descr)) < 0)
+		goto err_detach;
+
+#if defined(__x86_64__)
+	orig_regs->rax = orig_regs->orig_rax;
+	orig_regs->orig_rax = -1;
+	/* cancel pending syscall with that orig_rax == -1 */
+	if ((err = ptrace_set_regs(pid, orig_regs, descr)) < 0)
+		goto err_detach;
+#elif defined(__aarch64__)
+	/* On ARM64 we need to cancel pending syscall with explicit NT_ARM_SYSTEM_CALL */
+	int syscall_nr = -1;
+	struct iovec iov = {
+		.iov_base = &syscall_nr,
+		.iov_len = sizeof(syscall_nr),
+	};
+	if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_SYSTEM_CALL, &iov) < 0) {
+		err = -errno;
+		fprintf(stderr, "ptrace(PTRACE_SETREGSET, NT_ARM_SYSTEM_CALL, nr=%d, %s) failed: %d\n",
+			syscall_nr, descr, err);
+		goto err_detach;
+	}
+#else
+#error "Unsupported architecture"
+#endif
+
+	/*
+	 * Now that we "cancelled" original syscall proceed to
+	 * syscall-exit-stop, so that all subsequent operations start from
+	 * clean slate
+	 */
+	if ((err = ptrace_op(pid, PTRACE_SYSCALL, 0, descr)) < 0)
+		goto err_detach;
+	if ((err = ptrace_wait_syscall(pid, descr)) < 0)
+		goto err_detach;
+
+#if defined(__x86_64__)
+	orig_regs->rip -= 2; /* adjust for syscall replay, syscall instruction is 2 bytes */
+#elif defined(__aarch64__)
+	orig_regs->pc -= 4; /* adjust for syscall replay, arm64 instruction is 4 bytes */
+#else
+#error "Unsupported architecture"
+#endif
+
+	/*
+	 * Now we are in syscall-exit-stop, we can replay/restart syscall or
+	 * proceed with user space code execution
+	 */
+	return 0;
+
+err_detach:
+	(void)ptrace_op(pid, PTRACE_DETACH, 0, descr);
+	return err;
+}
+
+static int ptrace_replay(int pid, const struct user_regs_struct *orig_regs, const char *descr)
 {
 	int err = 0;
 
 	err = err ?: ptrace_set_regs(pid, orig_regs, descr);
 	err = err ?: ptrace_op(pid, PTRACE_SYSCALL, 0, descr);
-	err = err ?: ptrace_wait_syscall(pid, descr);
+	err = err ?: ptrace_wait_syscall(pid, descr); /* syscall-enter-stop */
+
+	/*
+	 * Don't wait for the original syscall to return. This might never
+	 * happen (long sleep() or long blocking read()). Just detach
+	 * from syscall-enter-stop step and let kernel complete
+	 * the syscall successfully.
+	 */
+
+	int detach_err = ptrace_op(pid, PTRACE_DETACH, 0, descr);
+	err = err ?: detach_err;
 
 	return err;
 }
 
-__attribute__((unused))
-static int ptrace_cont_syscall(int pid, const char *descr)
+static int ptrace_exec_user_call(int pid, long exec_mmap_addr, long func_addr,
+				  struct user_regs_struct *regs, long *res,
+				  const char *descr)
 {
-	int err = 0;
+	long inj_trap_addr = exec_mmap_addr + __inj_trap - __inj_call;
+	int err;
 
-	err = err ?: ptrace_op(pid, PTRACE_SYSCALL, 0, descr);
-	err = err ?: ptrace_wait_syscall(pid, descr);
+	___regs_set_ip(regs, exec_mmap_addr);
+	___regs_set_tramp_dst(regs, func_addr);
+	___regs_adjust_sp(regs);
+	/* function arguments are set through regs already */
 
-	return err;
+	if ((err = ptrace_set_regs(pid, regs, descr)) < 0)
+		return err;
+	if ((err = ptrace_op(pid, PTRACE_CONT, 0, descr)) < 0)
+		return err;
+	if ((err = ptrace_wait_signal(pid, SIGTRAP, inj_trap_addr, descr)) < 0)
+		return err;
+	if ((err = ptrace_get_regs(pid, regs, descr)) < 0)
+		return err;
+
+	*res = ___regs_result(regs);
+
+	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -631,118 +831,90 @@ int main(int argc, char *argv[])
 	       libc_tracee_base, dlopen_tracee_addr, dlclose_tracee_addr);
 
 	/*
-	 * Attach to tracee
-	 */
-	printf("Seizing...\n");
-	if (ptrace_op(pid, PTRACE_SEIZE, 0, "tracee-seize") < 0)
-		return 1;
-	printf("Interrupting...\n");
-	if (ptrace_op(pid, PTRACE_INTERRUPT, 0, "tracee-interrupt") < 0)
-		return 1;
-	if (ptrace_wait_stop(pid, "tracee-wait-stop") < 0)
-		return 1;
-
-	/*
-	 * Take over next syscall
+	 * Attach to tracee and intercept syscall
 	 */
 	struct user_regs_struct orig_regs, regs;
 
-	printf("Setting PTRACE_O_TRACESYSGOOD option for PID %d...\n", pid);
-	if (ptrace_set_options(pid, PTRACE_O_TRACESYSGOOD, "tracee-set-opts") < 0)
-		return 1;
-	printf("Resuming until syscall...\n");
-	if (ptrace_op(pid, PTRACE_SYSCALL, 0, "tracee-resume-until-syscall") < 0)
-		return 1;
-	if (ptrace_wait_syscall(pid, "wait-syscall-enter") < 0)
+	printf("Intercepting tracee...\n");
+	if (ptrace_intercept(pid, &orig_regs, "tracee-intercept") < 0)
 		return 1;
 
-	if (ptrace_get_regs(pid, &orig_regs, "backup-regs") < 0)
-		return 1;
-	/* XXX: arm64 will need something else */
-	orig_regs.rip -= 2; /* adjust for syscall replay, syscall instruction is 2 bytes */
 	print_regs(&orig_regs, "ORIG REGS");
 
 	/*
-	 * HIJACK SYSCALL: mmap(r-xp)
+	 * INJECT SYSCALL: mmap(RW) for data + exec
 	 */
 	const long page_size = sysconf(_SC_PAGESIZE);
+	const long data_mmap_sz = page_size;
 	const long exec_mmap_sz = page_size;
+	long data_mmap_addr = 0;
 	long exec_mmap_addr = 0;
 
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
+	printf("Executing mmap(data + exec)...\n");
 	/* void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset); */
-	regs.orig_rax = __NR_mmap;
-	regs.rdi = 0; /* addr */
-	regs.rsi = exec_mmap_sz; /* length */
-	regs.rdx = PROT_EXEC | PROT_READ; /* prot */
-	regs.r10 = MAP_ANONYMOUS | MAP_PRIVATE; /* flags */
-	regs.r8 = 0; /* fd */
-	regs.r9 = 0; /* offset */
-
-	printf("Executing mmap(r-xp)...\n");
-	if (ptrace_exec_syscall(pid, &regs, &regs, "hijack-mmap-exec") < 0)
+	regs = orig_regs;
+	___regs_set_sys_args(&regs, __NR_mmap,
+			     0, data_mmap_sz + exec_mmap_sz,
+			     PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (ptrace_exec_syscall(pid, &regs, &regs, "mmap-data+exec") < 0)
 		return 1;
 
-	exec_mmap_addr = regs.rax;
-	if (exec_mmap_addr <= 0) {
-		fprintf(stderr, "mmap(r-xp) inside tracee failed: %ld, bailing!\n", exec_mmap_addr);
-		return 1;
-	}
-	printf("mmap(r-xp) result: 0x%lx\n", (long)exec_mmap_addr);
-
-	/*
-	 * HIJACK SYSCALL: mmap(rw-p)
-	 */
-	if (ptrace_restart_syscall(pid, &orig_regs, "hijack-syscall-restart") < 0)
-		return 1;
-
-	const long data_mmap_sz = page_size;
-	long data_mmap_addr = 0;
-
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
-	regs.orig_rax = __NR_mmap;
-	regs.rdi = 0; /* addr */
-	regs.rsi = data_mmap_sz; /* length */
-	regs.rdx = PROT_WRITE | PROT_READ; /* prot */
-	regs.r10 = MAP_ANONYMOUS | MAP_PRIVATE; /* flags */
-	regs.r8 = 0; /* fd */
-	regs.r9 = 0; /* offset */
-
-	printf("Executing mmap(rw-p)...\n");
-	if (ptrace_exec_syscall(pid, &regs, &regs, "hijack-mmap-data") < 0)
-		return 1;
-
-	data_mmap_addr = regs.rax;
+	data_mmap_addr = ___regs_result(&regs);
 	if (data_mmap_addr <= 0) {
-		fprintf(stderr, "mmap(rw-p) inside tracee failed: %ld, bailing!\n", data_mmap_addr);
+		fprintf(stderr, "mmap() inside tracee failed: %ld, bailing!\n", data_mmap_addr);
 		return 1;
 	}
-	printf("mmap(rw-p) result: 0x%lx\n", (long)data_mmap_addr);
+
+	exec_mmap_addr = data_mmap_addr + data_mmap_sz;
+	printf("mmap() returned 0x%lx (data @ %lx, exec @ %lx)\n",
+	       data_mmap_addr, data_mmap_addr, exec_mmap_addr);
 
 	/*
-	 * HIJACK SYSCALL: memfd_create()
+	 * Setup executable function call trampoline by copying inj_call()
+	 * code into (soon-to-be) executable mmap()'ed memory
 	 */
-	if (ptrace_restart_syscall(pid, &orig_regs, "hijack-syscall-restart") < 0)
+	err = remote_vm_write(pid, (void *)exec_mmap_addr, __inj_call, __inj_call_sz);
+	if (err)
 		return 1;
 
-	int memfd_remote_fd = -1;
+	/*
+	 * INJECT SYSCALL: mprotect(r-x) on exec region
+	 */
+	printf("Executing mprotect(r-x)...\n");
+	/* int mprotect(void *addr, size_t size, int prot); */
+	regs = orig_regs;
+	___regs_set_sys_args(&regs, __NR_mprotect,
+			     exec_mmap_addr, exec_mmap_sz, PROT_EXEC | PROT_READ);
+
+	long mprotect_ret;
+	if (ptrace_exec_syscall(pid, &regs, &regs, "mprotect-rx") < 0)
+		return 1;
+	mprotect_ret = ___regs_result(&regs);
+	if (mprotect_ret < 0) {
+		fprintf(stderr, "mprotect(r-x) inside tracee failed: %ld, bailing!\n", mprotect_ret);
+		return 1;
+	}
+
+	/*
+	 * INJECT SYSCALL: memfd_create()
+	 */
+	printf("Executing memfd_create()...\n");
+
 	char memfd_name[] = "shlib-inject";
+	int memfd_remote_fd = -1;
 
 	err = remote_vm_write(pid, (void *)data_mmap_addr, memfd_name, sizeof(memfd_name));
 	if (err)
 		return 1;
 
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
 	/* int memfd_create(const char *name, unsigned int flags); */
-	regs.orig_rax = __NR_memfd_create;
-	regs.rdi = data_mmap_addr; /* name */
-	regs.rsi = MFD_CLOEXEC; /* flags */
+	regs = orig_regs;
+	___regs_set_sys_args(&regs, __NR_memfd_create, data_mmap_addr, MFD_CLOEXEC);
 
-	printf("Executing memfd_create()...\n");
-	if (ptrace_exec_syscall(pid, &regs, &regs, "hijack-memfd_create") < 0)
+	if (ptrace_exec_syscall(pid, &regs, &regs, "memfd_create") < 0)
 		return 1;
 
-	memfd_remote_fd = regs.rax;
+	memfd_remote_fd = ___regs_result(&regs);
 	if (memfd_remote_fd < 0) {
 		fprintf(stderr, "memfd_create() inside tracee failed: %d, bailing!\n", memfd_remote_fd);
 		return 1;
@@ -761,7 +933,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* XXX: embed shared lib into memory */
+	/* Copy shared library to memfd */
 	err = copy_file_to_fd("libinj.so", memfd_local_fd);
 	if (err)
 		return 1;
@@ -773,44 +945,26 @@ int main(int argc, char *argv[])
 	if (err)
 		return 1;
 
-	/* Copy over inj_call() code into executable mmap() */
-	if (ptrace_write_insns(pid, exec_mmap_addr, &__inj_call, __inj_call_sz, "write-inj-call"))
-		return 1;
-
-	long inj_trap_addr = exec_mmap_addr + &__inj_trap - &__inj_call;
-
 	printf("Executing dlopen() injection...\n");
 
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
-	regs.rip = exec_mmap_addr;
-	regs.rax = dlopen_tracee_addr;
-	regs.rdi = data_mmap_addr; /* name */
-	regs.rsi = RTLD_LAZY; /* flags */
-	regs.rsp = (regs.rsp & ~0xFULL) - 128; /* ensure 16-byte alignment and set up red zone */
-
-	if (ptrace_set_regs(pid, &regs, "set-inj_dlopen-regs") < 0)
-		return 1;
-	if (ptrace_op(pid, PTRACE_CONT, 0, "run-inj_dlopen") < 0)
-		return 1;
-	if (ptrace_wait_signal(pid, SIGTRAP, inj_trap_addr, "wai-inj_dlopen") < 0)
-		return 1;
-	if (ptrace_get_regs(pid, &regs, "get_inj_dlopen-regs") < 0)
+	/* void *dlopen(const char *path, int flags); */
+	long dlopen_handle;
+	regs = orig_regs;
+	___regs_set_func_args(&regs, data_mmap_addr, RTLD_LAZY);
+	if (ptrace_exec_user_call(pid, exec_mmap_addr, dlopen_tracee_addr, &regs, &dlopen_handle, "dlopen") < 0)
 		return 1;
 
-	long dlopen_handle = regs.rax;
 	printf("dlopen() result: %lx\n", dlopen_handle);
 	if (dlopen_handle == 0) {
 		fprintf(stderr, "Failed to dlopen() injection library, bailing...\n");
 		return 1;
 	}
 
-	/* 
+	/*
 	 * Execute original intercepted syscall
 	 */
-	printf("Replaying original syscall...\n");
-	if (ptrace_restart_syscall(pid, &orig_regs, "hijack-syscall-restart") < 0)
-		return 1;
-	if (ptrace_op(pid, PTRACE_CONT, 0, "syscall-continue") < 0)
+	printf("Replaying original syscall and detaching tracee...\n");
+	if (ptrace_replay(pid, &orig_regs, "replay-syscall") < 0)
 		return 1;
 
 	/* just idly wait... */
@@ -819,117 +973,56 @@ int main(int argc, char *argv[])
 	/*
 	 * Interrupt tracee again for clean up
 	 */
-	printf("Interrupting...\n");
-	if (ptrace_op(pid, PTRACE_INTERRUPT, 0, "tracee-interrupt") < 0)
+	printf("Re-intercepting for cleanup...\n");
+	if (ptrace_intercept(pid, &orig_regs, "tracee-reintercept") < 0)
 		return 1;
-	if (ptrace_wait_stop(pid, "tracee-wait-stop") < 0)
-		return 1;
-	printf("Intercepting syscall...\n");
-	if (ptrace_op(pid, PTRACE_SYSCALL, 0, "tracee-resume-until-syscall") < 0)
-		return 1;
-	if (ptrace_wait_syscall(pid, "wait-syscall-enter") < 0)
-		return 1;
-
-	if (ptrace_get_regs(pid, &orig_regs, "backup-regs") < 0)
-		return 1;
-	orig_regs.rip -= 2; // adjust for syscall replay, syscall instruction is 2 bytes
 	print_regs(&orig_regs, "ORIG REGS (2)");
 
 	/*
 	 * dlclose() injection
 	 */
 	printf("Executing dlclose() injection...\n");
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
-	regs.rip = exec_mmap_addr;
-	regs.orig_rax = -1; /* cancel syscall execution (!) */
-	regs.rax = dlclose_tracee_addr;
-	regs.rdi = dlopen_handle;
-	regs.rsp = (regs.rsp & ~0xFULL) - 128; /* ensure 16-byte alignment and set up red zone */
-
-	if (ptrace_set_regs(pid, &regs, "set-inj_dlclose-regs") < 0)
+	long dlclose_ret;
+	regs = orig_regs;
+	___regs_set_func_args(&regs, dlopen_handle);
+	if (ptrace_exec_user_call(pid, exec_mmap_addr, dlclose_tracee_addr, &regs, &dlclose_ret, "dlclose") < 0)
 		return 1;
-	if (ptrace_op(pid, PTRACE_CONT, 0, "run-inj_dlclose") < 0)
-		return 1;
-	if (ptrace_wait_signal(pid, SIGTRAP, inj_trap_addr, "wai-inj_dlclose") < 0)
-		return 1;
-	if (ptrace_get_regs(pid, &regs, "get_inj_dlclose-regs") < 0)
-		return 1;
-	int dlclose_ret = regs.rax;
-	printf("dlclose() result: %d\n", dlclose_ret);
-	if (dlclose_ret < 0) {
+	printf("dlclose() result: %ld\n", dlclose_ret);
+	if (dlclose_ret != 0) {
 		fprintf(stderr, "Failed to dlclose() injection library, bailing...\n");
 		return 1;
 	}
 
 	/*
-	 * Inject munmap(rw-p) syscall
+	 * INJECT SYSCALL: munmap(data + exec)
 	 */
-	if (ptrace_restart_syscall(pid, &orig_regs, "hijack-syscall-restart") < 0)
-		return 1;
-
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
+	printf("Executing munmap(data + exec)...\n");
 	/* int munmap(void *addr, size_t len); */
-	regs.orig_rax = __NR_munmap;
-	regs.rdi = data_mmap_addr;
-	regs.rsi = data_mmap_sz;
-	if (ptrace_exec_syscall(pid, &regs, &regs, "hijack-munmap-data") < 0)
+	regs = orig_regs;
+	___regs_set_sys_args(&regs, __NR_munmap, data_mmap_addr, data_mmap_sz + exec_mmap_sz);
+	if (ptrace_exec_syscall(pid, &regs, &regs, "munmap-data+exec") < 0)
 		return 1;
-	long data_munmap_ret = regs.rax;
-	if (data_munmap_ret < 0) {
-		fprintf(stderr, "munmap(rw-p) inside tracee failed: %ld, bailing!\n", data_munmap_ret);
+	long munmap_ret = ___regs_result(&regs);
+	if (munmap_ret < 0) {
+		fprintf(stderr, "munmap() inside tracee failed: %ld, bailing!\n", munmap_ret);
 		return 1;
 	}
-	printf("munmap(rw-p) result: 0x%lx\n", data_munmap_ret);
-
-	/*
-	 * Inject munmap(r-xp) syscall
-	 */
-	if (ptrace_restart_syscall(pid, &orig_regs, "hijack-syscall-restart") < 0)
-		return 1;
-
-	memcpy(&regs, &orig_regs, sizeof(orig_regs));
-	/* int munmap(void *addr, size_t len); */
-	regs.orig_rax = __NR_munmap;
-	regs.rdi = exec_mmap_addr;
-	regs.rsi = exec_mmap_sz;
-	if (ptrace_exec_syscall(pid, &regs, &regs, "hijack-munmap-exec") < 0)
-		return 1;
-	long exec_munmap_ret = regs.rax;
-	if (exec_munmap_ret < 0) {
-		fprintf(stderr, "munmap(r-xp) inside tracee failed: %ld, bailing!\n", exec_munmap_ret);
-		return 1;
-	}
-	printf("munmap(r-xp) result: 0x%lx\n", exec_munmap_ret);
+	printf("munmap() result: %ld\n", munmap_ret);
 
 	/*
 	 * Replay intercepted original syscall
 	 */
-	printf("Replaying original syscall...\n");
-	if (ptrace_restart_syscall(pid, &orig_regs, "hijack-syscall-restart") < 0)
-		return 1;
-	if (ptrace_op(pid, PTRACE_CONT, 0, "syscall-continue") < 0)
+	printf("Replaying original syscall and detaching tracee...\n");
+	if (ptrace_replay(pid, &orig_regs, "replay-syscall-final") < 0)
 		return 1;
 
-
-	printf("Tracee is running...\n");
+	printf("Tracee detached and running...\n");
 	printf("Press Ctrl-C to exit...\n");
 
 	while (!should_exit) {
 		usleep(50000);
 	}
 
-	/*
-	 * Detach from tracee
-	 */
-	printf("Interrupting...\n");
-	if (ptrace_op(pid, PTRACE_INTERRUPT, 0, "tracee-interrupt") < 0)
-		return 1;
-	if (ptrace_wait_stop(pid, "tracee-wait-stop") < 0)
-		return 1;
-	printf("Detaching tracee...\n");
-	if (ptrace_op(pid, PTRACE_DETACH, SIGCONT, "tracee_detach") < 0)
-		return 1;
-	printf("Tracee detached...\n");
 	printf("Exited gracefully.\n");
 	return 0;
 }
