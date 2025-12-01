@@ -4,7 +4,7 @@ shared library injection prototype
 Run tracee app first:
 
 ```
-$ LD_LIBRARY_PATH=. ./app
+$ ./app
 ```
 
 Then run injection:
