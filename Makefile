@@ -7,7 +7,7 @@ libapp.so: app_lib.c
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $<
 
 app: app.c libapp.so
-	$(CC) $(CFLAGS) -o $@ $< -L. -lapp
+	$(CC) $(CFLAGS) -o $@ $< -L. -lapp -Wl,-rpath,'$$ORIGIN'
 
 libinj.so: inj_lib.c
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ $<
